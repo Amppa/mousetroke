@@ -58,6 +58,14 @@ impl Canvas for Overlay {
 pub(crate) struct SystemHost;
 
 impl Host for SystemHost {
+    fn screen_rect_at(&self, x: i32, y: i32) -> Option<mousetroke_core::edge::ScreenRect> {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        let mon = unsafe { MonitorFromPoint(windows::Win32::Foundation::POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !unsafe { GetMonitorInfoW(mon, &mut info) }.as_bool() { return None; }
+        let r = info.rcMonitor;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
     fn target_at(&self, x: i32, y: i32) -> Target {
         targeting::resolve_under_cursor(x, y).into()
     }

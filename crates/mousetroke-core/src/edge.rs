@@ -44,6 +44,12 @@ pub const CORNER_PX: i32 = 6;
 /// 边判定厚度（px）。
 pub const EDGE_PX: i32 = 4;
 
+pub type ScreenRect = (i32, i32, i32, i32);
+
+pub fn contains((rx, ry, rw, rh): ScreenRect, x: i32, y: i32) -> bool {
+    rw > 0 && rh > 0 && x >= rx && x < rx + rw && y >= ry && y < ry + rh
+}
+
 /// 点 `(x, y)` 位于矩形 `(rx, ry, rw, rh)` 的哪条边/角；不在边上返回 `None`。角优先于边。
 pub fn edge_at(x: i32, y: i32, (rx, ry, rw, rh): (i32, i32, i32, i32)) -> Option<u8> {
     let dl = x - rx;

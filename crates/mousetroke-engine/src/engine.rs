@@ -102,6 +102,8 @@ enum CaptureState {
 
 struct Capture {
     trigger: Trigger,
+    /// 边缘手势起始显示器；后续贴边与离边判断始终使用此矩形。
+    edge_rect: Option<edge::ScreenRect>,
     /// 触发之外的附加按键（按时间序）。
     presses: Vec<PatternKey>,
     /// 轨迹开始时已有的附加键数（轨迹在步骤序列中的位置）。
@@ -214,7 +216,7 @@ pub struct Engine {
     echoes: Vec<(MouseButton, bool, Instant)>,
     /// 最近几次补发单击的时刻（回声识别失效时的熔断）。
     recent_replays: VecDeque<Instant>,
-    edge_pending: Option<(u8, Instant)>,
+    edge_pending: Option<(u8, edge::ScreenRect, Instant)>,
     /// 边角触发/取消后需先离开所有边缘才重新武装。
     edge_disarmed: bool,
     /// 设置窗口里录制画布的屏幕矩形（左、上、右、下）；按键在其中按下时放行，供画布自己画轨迹。
@@ -359,6 +361,8 @@ impl Engine {
     /// 显示器布局变化（WM_DISPLAYCHANGE）：重建覆盖层以匹配新的虚拟屏。
     pub fn on_display_change(&mut self) {
         self.abort_capture();
+        self.edge_pending = None;
+        self.edge_disarmed = false;
         let s = &self.cfg.settings.trail;
         crate::log!("显示器布局变化，重建覆盖层");
         if let Some(o) = self.host.new_canvas(&s.color_normal, s.width) {
@@ -613,7 +617,8 @@ impl Engine {
         match cap.trigger {
             Trigger::Button(_) => self.track(x, y, true),
             Trigger::Edge(e) => {
-                let away = edge::distance_from(e, x, y, self.overlay.virtual_rect());
+                let rect = cap.edge_rect.unwrap_or(self.overlay.virtual_rect());
+                let away = edge::distance_from(e, x, y, rect);
                 if cap.held.is_empty() && cap.presses.is_empty() && away > EDGE_LEAVE_PX {
                     self.end_edge_capture();
                     return Verdict::Pass;
@@ -711,7 +716,7 @@ impl Engine {
         if self.edge_triggers.is_empty() {
             return;
         }
-        let at = edge::edge_at(x, y, self.overlay.virtual_rect());
+        let at = self.host.screen_rect_at(x, y).and_then(|rect| edge::edge_at(x, y, rect).map(|edge| (edge, rect)));
         if self.edge_disarmed {
             if at.is_none() {
                 self.edge_disarmed = false;
@@ -719,14 +724,14 @@ impl Engine {
             return;
         }
         let now = Instant::now();
-        match (at.filter(|e| self.edge_triggers.contains(e)), self.edge_pending) {
-            (Some(e), Some((pending, since))) if pending == e => {
+        match (at.filter(|(e, _)| self.edge_triggers.contains(e)), self.edge_pending) {
+            (Some((e, rect)), Some((pending, pending_rect, since))) if pending == e && pending_rect == rect => {
                 if now.duration_since(since) >= EDGE_DWELL && !self.fullscreen_paused() {
                     self.edge_pending = None;
-                    self.start_edge_capture(e, x, y);
+                    self.start_edge_capture(e, rect, x, y);
                 }
             }
-            (Some(e), _) => self.edge_pending = Some((e, now)),
+            (Some((e, rect)), _) => self.edge_pending = Some((e, rect, now)),
             (None, _) => self.edge_pending = None,
         }
     }
@@ -749,6 +754,7 @@ impl Engine {
         self.live_label = None;
         self.capture = Some(Capture {
             trigger,
+            edge_rect: None,
             presses: Vec::new(),
             trace_at: None,
             held: Vec::new(),
@@ -764,8 +770,9 @@ impl Engine {
 
     /// 边缘触发开始：纯边角绑定立即执行（如 左下角=开始菜单）；
     /// 否则若存在以该边角开头的组合手势，进入边缘捕获。
-    fn start_edge_capture(&mut self, e: u8, x: i32, y: i32) {
+    fn start_edge_capture(&mut self, e: u8, rect: edge::ScreenRect, x: i32, y: i32) {
         self.start_capture(Trigger::Edge(e), x, y);
+        if let Some(cap) = &mut self.capture { cap.edge_rect = Some(rect); }
         let steps = vec![matcher::build_steps(Trigger::Edge(e), &[], None)];
         if let Some(b) = self.match_steps(&steps, &[], None) {
             crate::log!("手势命中: {}（{}）", b.name, edge::name(e));
@@ -1022,7 +1029,10 @@ impl Engine {
     /// 边缘捕获中，(x, y) 是否贴着该边/角（边缘手势的第一步按键/滚轮要求）。
     fn pressed_at_edge(&self, x: i32, y: i32) -> bool {
         match self.capture.as_ref().map(|c| c.trigger) {
-            Some(Trigger::Edge(e)) => edge::distance_from(e, x, y, self.overlay.virtual_rect()) <= EDGE_PRESS_PX,
+            Some(Trigger::Edge(e)) => {
+                let rect = self.capture.as_ref().and_then(|cap| cap.edge_rect).unwrap_or(self.overlay.virtual_rect());
+                edge::distance_from(e, x, y, rect) <= EDGE_PRESS_PX
+            }
             _ => false,
         }
     }

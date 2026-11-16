@@ -56,9 +56,20 @@ struct FakeHost {
     log: Shared,
     under: Under,
     fullscreen: Rc<RefCell<Option<Target>>>,
+    screens: Rc<RefCell<Vec<edge::ScreenRect>>>,
 }
 
 impl Host for FakeHost {
+    fn screen_rect_at(&self, x: i32, y: i32) -> Option<edge::ScreenRect> {
+        let screens = self.screens.borrow();
+        screens.iter().copied().find(|&rect| edge::contains(rect, x, y)).or_else(|| {
+            screens.iter().copied().min_by_key(|&(rx, ry, rw, rh)| {
+                let dx = (x - x.clamp(rx, rx + rw - 1)).unsigned_abs() as i64;
+                let dy = (y - y.clamp(ry, ry + rh - 1)).unsigned_abs() as i64;
+                dx * dx + dy * dy
+            })
+        })
+    }
     fn target_at(&self, _: i32, _: i32) -> Target {
         let (class, exe) = self.under.borrow().clone();
         Target { wid: 0, pid: 0, exe, is_desktop: false, class }
@@ -169,6 +180,7 @@ struct T {
     log: Shared,
     under: Under,
     fullscreen: Rc<RefCell<Option<Target>>>,
+    screens: Rc<RefCell<Vec<edge::ScreenRect>>>,
     pos: (i32, i32),
     _lang: std::sync::MutexGuard<'static, ()>,
 }
@@ -193,15 +205,19 @@ impl T {
         let log = Shared::default();
         let under: Under = Rc::new(RefCell::new(("Chrome_WidgetWin_1".into(), Some(r"C:\app\chrome.exe".into()))));
         let fullscreen = Rc::new(RefCell::new(None));
-        let host = FakeHost { log: log.clone(), under: under.clone(), fullscreen: fullscreen.clone() };
+        let screens = Rc::new(RefCell::new(vec![(0, 0, 1920, 1080)]));
+        let host = FakeHost { log: log.clone(), under: under.clone(), fullscreen: fullscreen.clone(), screens: screens.clone() };
         let e = Engine::with_parts(cfg, None, Box::new(FakeCanvas(log.clone())), Box::new(host), shape_samples);
-        Self { e, log, under, fullscreen, pos: (960, 540), _lang: lang }
+        Self { e, log, under, fullscreen, screens, pos: (960, 540), _lang: lang }
     }
     fn under(&self, class: &str, exe: Option<&str>) {
         *self.under.borrow_mut() = (class.into(), exe.map(Into::into));
     }
     fn fullscreen(&self, exe: Option<&str>) {
         *self.fullscreen.borrow_mut() = Some(Target { wid: 1, pid: 1, exe: exe.map(Into::into), is_desktop: false, class: String::new() });
+    }
+    fn screens(&self, rects: Vec<edge::ScreenRect>) {
+        *self.screens.borrow_mut() = rects;
     }
     fn down(&mut self, btn: B) -> Verdict {
         let (x, y) = self.pos;
@@ -295,7 +311,7 @@ fn fullscreen_blocks_and_allows_edge() {
             let mut t = T::with_config(fullscreen_config(if allow { FullscreenPolicy::Allow } else { FullscreenPolicy::Inherit }));
             t.fullscreen(Some("chrome.exe"));
             t.to(0, 1079);
-            t.e.edge_pending.as_mut().unwrap().1 -= EDGE_DWELL;
+            t.e.edge_pending.as_mut().unwrap().2 -= EDGE_DWELL;
             if stationary { t.e.settle_edges(0, 1079); } else { t.to(0, 1079); }
             assert_eq!(t.executed(), if allow { vec!["start"] } else { vec![] });
         }
@@ -1022,6 +1038,77 @@ fn top_edge_combo_and_wheel() {
 }
 
 #[test]
+fn offset_monitors_each_support_top_wheel() {
+    let mut t = T::new(true);
+    t.screens(vec![(0, 0, 1536, 864), (1536, -285, 2048, 1152)]);
+    t.dwell(500, 0);
+    assert_eq!(t.wheel(-1), Verdict::Swallow);
+    t.to(500, 100);
+    t.to(2000, 100);
+    t.dwell(2000, -285);
+    assert_eq!(t.wheel(-1), Verdict::Swallow);
+    assert_eq!(t.executed(), ["vol_up", "vol_up"]);
+}
+
+#[test]
+fn shared_seam_is_a_separate_edge_on_each_monitor() {
+    let mut cfg = config(false);
+    cfg.scopes[0].bindings.push(bind("left_wheel", vec![Step::Edge { edge: edge::LEFT }, press(PatternKey::Wheel(-1))]));
+    cfg.scopes[0].bindings.push(bind("right_wheel", vec![Step::Edge { edge: edge::RIGHT }, press(PatternKey::Wheel(-1))]));
+    let mut t = T::with_config(cfg);
+    t.screens(vec![(0, 0, 1536, 864), (1536, -285, 2048, 1152)]);
+    t.dwell(1535, 400);
+    assert_eq!(t.wheel(-1), Verdict::Swallow);
+    t.to(500, 400);
+    t.to(500, 500);
+    t.dwell(1536, 400);
+    assert_eq!(t.wheel(-1), Verdict::Swallow);
+    assert_eq!(t.executed(), ["right_wheel", "left_wheel"]);
+}
+
+#[test]
+fn each_corner_of_smaller_monitor_uses_its_own_rectangle() {
+    let mut cfg = config(false);
+    cfg.scopes[0].bindings.push(bind("top_left", vec![Step::Edge { edge: edge::LEFT_TOP }]));
+    cfg.scopes[0].bindings.push(bind("top_right", vec![Step::Edge { edge: edge::RIGHT_TOP }]));
+    cfg.scopes[0].bindings.push(bind("bottom_right", vec![Step::Edge { edge: edge::RIGHT_BOTTOM }]));
+    let mut t = T::with_config(cfg);
+    t.screens(vec![(0, 0, 1536, 864), (1536, -285, 2048, 1152)]);
+    for ((x, y), expected) in [
+        ((0, 0), "top_left"),
+        ((1535, 0), "top_right"),
+        ((0, 863), "start"),
+        ((1535, 863), "bottom_right"),
+    ] {
+        t.dwell(x, y);
+        assert_eq!(t.executed().last().map(String::as_str), Some(expected));
+        t.to(700, 400);
+        t.to(800, 400);
+    }
+}
+
+#[test]
+fn edge_dwell_survives_a_one_pixel_overshoot() {
+    let mut t = T::new(false);
+    t.to(0, 1079);
+    t.e.edge_pending.as_mut().unwrap().2 -= EDGE_DWELL;
+    t.to(-1, 1079);
+    assert_eq!(t.executed(), ["start"]);
+}
+
+#[test]
+fn edge_wheel_survives_a_one_pixel_overshoot() {
+    let mut cfg = config(false);
+    cfg.scopes[0].bindings.push(bind("left_wheel", vec![Step::Edge { edge: edge::LEFT }, press(PatternKey::Wheel(-1))]));
+    let mut t = T::with_config(cfg);
+    t.to(0, 400);
+    t.e.edge_pending.as_mut().unwrap().2 -= EDGE_DWELL;
+    t.to(-1, 400);
+    assert_eq!(t.wheel(-1), Verdict::Swallow);
+    assert_eq!(t.executed(), ["left_wheel"]);
+}
+
+#[test]
 fn left_click_at_top_edge_passes() {
     let mut t = T::new(true);
     t.dwell(960, 0);
@@ -1049,7 +1136,7 @@ fn stationary_corner_settle_respects_dwell_pause_and_rearm() {
     t.to(0, 1079);
     t.e.settle_edges(0, 1079);
     assert!(t.executed().is_empty());
-    t.e.edge_pending.as_mut().unwrap().1 = Instant::now() - EDGE_DWELL;
+    t.e.edge_pending.as_mut().unwrap().2 = Instant::now() - EDGE_DWELL;
     t.e.settle_edges(1, 1079);
     assert!(t.executed().is_empty(), "过期坐标不能触发");
     t.e.set_paused(true);
@@ -1062,7 +1149,7 @@ fn stationary_corner_settle_respects_dwell_pause_and_rearm() {
     assert_eq!(t.executed(), ["start"]);
     t.to(300, 700);
     t.to(0, 1079);
-    t.e.edge_pending.as_mut().unwrap().1 = Instant::now() - EDGE_DWELL;
+    t.e.edge_pending.as_mut().unwrap().2 = Instant::now() - EDGE_DWELL;
     t.e.settle_edges(0, 1079);
     assert_eq!(t.executed(), ["start", "start"]);
 }

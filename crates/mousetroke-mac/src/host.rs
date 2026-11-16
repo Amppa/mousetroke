@@ -100,8 +100,24 @@ pub fn virtual_top_left() -> Option<(i32, i32)> {
 pub fn screen_rect(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
     SCREEN.with(|slot| {
         let screen = slot.borrow();
-        screen.displays.iter().find(|d| d.frame.contains(x as f64, y as f64))
-            .or_else(|| screen.displays.first()).map(|d| {
+        let x = x as f64;
+        let y = y as f64;
+        screen
+            .displays
+            .iter()
+            .find(|d| d.frame.contains(x, y))
+            // 事件接近边界时坐标可能暂时落在显示器外一两个点，仍应使用最近屏幕。
+            .or_else(|| {
+                screen.displays.iter().min_by(|a, b| {
+                    let distance = |r: Rect| {
+                        let dx = (x - x.clamp(r.x, r.x + r.w)).abs();
+                        let dy = (y - y.clamp(r.y, r.y + r.h)).abs();
+                        dx * dx + dy * dy
+                    };
+                    distance(a.frame).total_cmp(&distance(b.frame))
+                })
+            })
+            .map(|d| {
                 let r = d.frame;
                 (r.x as i32, r.y as i32, (r.x + r.w) as i32, (r.y + r.h) as i32)
             })
@@ -117,6 +133,9 @@ pub fn cursor_pos() -> Option<CGPoint> {
 
 pub struct SystemHost;
 impl Host for SystemHost {
+    fn screen_rect_at(&self, x: i32, y: i32) -> Option<mousetroke_core::edge::ScreenRect> {
+        screen_rect(x, y).map(|(left, top, right, bottom)| (left, top, right - left, bottom - top))
+    }
     fn target_at(&self, x: i32, y: i32) -> Target {
         crate::targeting::at(x, y)
     }

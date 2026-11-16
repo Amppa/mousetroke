@@ -42,6 +42,8 @@ pub trait Canvas {
 /// 引擎对系统的查询与副作用，全部从引擎线程调用。输入回调内的方法
 /// 必须快速返回，不得等待、无界分配或 panic；补发与动作执行必须异步，避免重入钩子。
 pub trait Host {
+    /// 返回坐标所在显示器的完整矩形；坐标与鼠标事件相同。
+    fn screen_rect_at(&self, x: i32, y: i32) -> Option<mousetroke_core::edge::ScreenRect>;
     /// 查询屏幕坐标下的目标；输入回调调用，须快速返回。
     fn target_at(&self, x: i32, y: i32) -> Target;
     /// 判断设置界面/系统外壳等应直接放行的目标；按键捕获前调用。
